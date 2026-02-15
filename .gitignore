@@ -1,0 +1,3 @@
+nacos-k8s/
+*.log
+.DS_Store
