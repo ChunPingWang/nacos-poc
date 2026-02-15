@@ -41,30 +41,54 @@ kubectl version --client                    # 確認 kubectl 已安裝
 
 ## 架構概覽
 
-```
-┌──────────────────────────────────────────────────┐
-│              Kind Cluster (nacos-poc)             │
-│                                                  │
-│  ┌──────────────┐      ┌───────────────────┐     │
-│  │    MySQL      │      │   Nacos Server    │     │
-│  │  (Deployment) │◄─────│  (StatefulSet)    │     │
-│  │  Port: 3306   │      │  Port: 8848       │     │
-│  │  DB: nacos_   │      │  Mode: standalone │     │
-│  │    devtest    │      │  Image: v3.1.1    │     │
-│  └──────────────┘      └───────┬───────────┘     │
-│                                │                  │
-│                     NodePort Service              │
-│                    30848 → 8848 (HTTP)            │
-│                    30948 → 9848 (gRPC)            │
-└────────────────────────────────┼──────────────────┘
-                                 │
-                      Kind Port Mapping
-                                 │
-                    ┌────────────┴────────────┐
-                    │     Host Machine         │
-                    │  localhost:8848 (HTTP)    │
-                    │  localhost:9848 (gRPC)    │
-                    └─────────────────────────┘
+```mermaid
+graph TB
+    subgraph Host["Host Machine"]
+        localhost_http["localhost:8848 (HTTP)"]
+        localhost_grpc["localhost:9848 (gRPC)"]
+    end
+
+    subgraph Kind["Kind Cluster (nacos-poc)"]
+        subgraph Services["Kubernetes Services"]
+            np["nacos-nodeport<br/>(NodePort)<br/>30848 → 8848<br/>30948 → 9848"]
+            hl["nacos-headless<br/>(Headless ClusterIP)"]
+            mysql_svc["mysql<br/>(ClusterIP :3306)"]
+        end
+
+        subgraph Workloads["Workloads"]
+            nacos["Nacos Server<br/>(StatefulSet)<br/>nacos/nacos-server:v3.1.1-slim<br/>Mode: standalone"]
+            mysql["MySQL 8.0.30<br/>(Deployment)<br/>DB: nacos_devtest"]
+        end
+
+        subgraph ConfigMaps["ConfigMaps"]
+            cm["nacos-cm<br/>MySQL 連線資訊"]
+            initdb["mysql-initdb<br/>Schema SQL"]
+        end
+    end
+
+    localhost_http -- "Kind Port Mapping" --> np
+    localhost_grpc -- "Kind Port Mapping" --> np
+    np --> nacos
+    hl --> nacos
+    nacos -- "JDBC :3306" --> mysql_svc
+    mysql_svc --> mysql
+    cm -. "env vars" .-> nacos
+    initdb -. "/docker-entrypoint-initdb.d" .-> mysql
+
+    style Kind fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff
+    style Host fill:#f5f5f5,stroke:#333,stroke-width:2px
+    style Services fill:#4a90d9,stroke:#fff,color:#fff
+    style Workloads fill:#2d6cb4,stroke:#fff,color:#fff
+    style ConfigMaps fill:#1a4d80,stroke:#fff,color:#fff
+    style nacos fill:#00bcd4,stroke:#fff,color:#fff
+    style mysql fill:#ff9800,stroke:#fff,color:#fff
+    style np fill:#8bc34a,stroke:#fff,color:#fff
+    style hl fill:#8bc34a,stroke:#fff,color:#fff
+    style mysql_svc fill:#8bc34a,stroke:#fff,color:#fff
+    style cm fill:#9c27b0,stroke:#fff,color:#fff
+    style initdb fill:#9c27b0,stroke:#fff,color:#fff
+    style localhost_http fill:#e0e0e0,stroke:#333
+    style localhost_grpc fill:#e0e0e0,stroke:#333
 ```
 
 ### 元件說明
@@ -408,6 +432,55 @@ curl -X DELETE 'http://localhost:8848/nacos/v3/client/ns/instance?serviceName=my
 
 ## 測試案例與結果
 
+### 測試流程
+
+```mermaid
+sequenceDiagram
+    participant T as Test Script
+    participant N as Nacos Server
+    participant M as MySQL
+
+    Note over T,M: Category 1 - Health Check
+    T->>N: GET /nacos/
+    N-->>T: HTTP 200
+
+    Note over T,M: Category 2 - Service Registration
+    T->>N: POST /v3/client/ns/instance (service-a #1)
+    N->>M: persist service
+    N-->>T: {"code":0, "data":"ok"}
+    T->>N: POST /v3/client/ns/instance (service-a #2)
+    N-->>T: {"code":0, "data":"ok"}
+    T->>N: POST /v3/client/ns/instance (service-b)
+    N-->>T: {"code":0, "data":"ok"}
+
+    Note over T,M: Category 3 - Service Discovery
+    T->>N: GET /v3/client/ns/instance/list?serviceName=service-a
+    N-->>T: 2 instances
+
+    Note over T,M: Category 4 - Config Management
+    T->>N: POST /v1/cs/configs (publish)
+    N->>M: persist config
+    N-->>T: true
+    T->>N: GET /v3/client/cs/config (read)
+    N-->>T: config content
+
+    Note over T,M: Category 5 - Config Update
+    T->>N: POST /v1/cs/configs (update)
+    N->>M: update config
+    N-->>T: true
+
+    Note over T,M: Category 6 - Deregistration
+    T->>N: DELETE /v3/client/ns/instance
+    N-->>T: {"code":0, "data":"ok"}
+    T->>N: GET /v3/client/ns/instance/list
+    N-->>T: 1 instance
+
+    Note over T,M: Category 7 - Config Deletion
+    T->>N: DELETE /v1/cs/configs
+    N->>M: delete config
+    N-->>T: true
+```
+
 ### 測試總覽
 
 | # | 分類 | 測試案例 | API 版本 | 結果 |
@@ -616,13 +689,24 @@ kind delete cluster --name nacos-poc
 
 ## 專案結構
 
-```
-nacos-poc/
-├── README.md              # 本文件
-├── kind-config.yaml       # Kind 叢集配置
-├── deploy/
-│   ├── mysql.yaml         # MySQL 部署 (Deployment + Service + ConfigMap)
-│   └── nacos.yaml         # Nacos 部署 (StatefulSet + Services + ConfigMap)
-├── test-nacos.sh          # 自動化測試腳本 (20 個測試案例)
-└── .gitignore
+```mermaid
+graph LR
+    root["nacos-poc/"]
+    root --- readme["README.md<br/><i>專案文件</i>"]
+    root --- kindcfg["kind-config.yaml<br/><i>Kind 叢集配置</i>"]
+    root --- deploy["deploy/"]
+    root --- test["test-nacos.sh<br/><i>自動化測試 (20 cases)</i>"]
+    root --- gitignore[".gitignore"]
+
+    deploy --- mysql_yaml["mysql.yaml<br/><i>Deployment + Service<br/>+ ConfigMap (schema)</i>"]
+    deploy --- nacos_yaml["nacos.yaml<br/><i>StatefulSet + Services<br/>+ ConfigMap (DB conn)</i>"]
+
+    style root fill:#263238,stroke:#fff,color:#fff
+    style deploy fill:#37474f,stroke:#fff,color:#fff
+    style readme fill:#42a5f5,stroke:#fff,color:#fff
+    style kindcfg fill:#66bb6a,stroke:#fff,color:#fff
+    style test fill:#ffa726,stroke:#fff,color:#fff
+    style mysql_yaml fill:#ef5350,stroke:#fff,color:#fff
+    style nacos_yaml fill:#ab47bc,stroke:#fff,color:#fff
+    style gitignore fill:#78909c,stroke:#fff,color:#fff
 ```
